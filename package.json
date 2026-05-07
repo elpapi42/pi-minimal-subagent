@@ -14,6 +14,7 @@
     ]
   },
   "scripts": {
+    "test": "node --test src/*.test.js",
     "typecheck": "tsc --noEmit"
   },
   "license": "MIT",

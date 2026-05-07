@@ -16,6 +16,7 @@ import {
 const isWindows = process.platform === "win32";
 const SIGKILL_TIMEOUT_MS = 5000;
 const AGENT_END_GRACE_MS = 250;
+const STDOUT_TAIL_LINES = 40;
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
 export interface RunSubagentOptions {
@@ -50,6 +51,31 @@ function cleanupTempDir(dir: string | null): void {
   } catch {
     // ignore cleanup errors
   }
+}
+
+function createArtifactFiles(): { dir: string; stdoutPath: string; stderrPath: string } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-minimal-subagent-output-"));
+  const stdoutPath = path.join(dir, "stdout.jsonl");
+  const stderrPath = path.join(dir, "stderr.log");
+  fs.writeFileSync(stdoutPath, "", { encoding: "utf-8", mode: 0o600 });
+  fs.writeFileSync(stderrPath, "", { encoding: "utf-8", mode: 0o600 });
+  return { dir, stdoutPath, stderrPath };
+}
+
+function appendArtifact(filePath: string | undefined, chunk: Buffer | string): void {
+  if (!filePath) return;
+  try {
+    fs.appendFileSync(filePath, chunk);
+  } catch {
+    // Preserve subagent execution even when diagnostic artifact writing fails.
+  }
+}
+
+function rememberStdoutLine(result: SubagentResult, line: string): void {
+  if (!line.trim()) return;
+  if (!Array.isArray(result.stdoutTail)) result.stdoutTail = [];
+  result.stdoutTail.push(line);
+  while (result.stdoutTail.length > STDOUT_TAIL_LINES) result.stdoutTail.shift();
 }
 
 function mergeExtensions(settings: Settings, agent: AgentConfig): string[] {
@@ -143,6 +169,10 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
 
   try {
     const piArgs = buildPiArgs({ task, systemPromptPath, settings, agent });
+    const artifacts = createArtifactFiles();
+    result.artifactDir = artifacts.dir;
+    result.stdoutArtifact = artifacts.stdoutPath;
+    result.stderrArtifact = artifacts.stderrPath;
     let wasAborted = false;
 
     const exitCode = await new Promise<number>((resolve) => {
@@ -199,6 +229,7 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
       };
 
       const flushLine = (line: string) => {
+        rememberStdoutLine(result, line);
         if (processPiJsonLine(line, result)) emitUpdate();
         maybeFinishFromAgentEnd();
       };
@@ -227,6 +258,7 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
       };
 
       const onStdoutData = (chunk: Buffer) => {
+        appendArtifact(result.stdoutArtifact, chunk);
         buffer += chunk.toString();
         const lines = buffer.split(/\r?\n/);
         buffer = lines.pop() || "";
@@ -234,6 +266,7 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
       };
 
       const onStderrData = (chunk: Buffer) => {
+        appendArtifact(result.stderrArtifact, chunk);
         result.stderr += chunk.toString();
       };
 
@@ -247,6 +280,7 @@ export async function runSubagent(opts: RunSubagentOptions): Promise<SubagentRes
       });
 
       proc.on("error", (err) => {
+        appendArtifact(result.stderrArtifact, `${err.message}\n`);
         if (!result.stderr.trim()) result.stderr = err.message;
         finish(1);
       });
